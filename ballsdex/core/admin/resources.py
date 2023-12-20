@@ -1,22 +1,25 @@
 import os
+from typing import List
+
 from fastapi_admin.app import app
 from fastapi_admin.enums import Method
 from fastapi_admin.file_upload import FileUpload
-from fastapi_admin.resources import Field, Link, Model, Action
+from fastapi_admin.resources import Action, Field, Link, Model
 from fastapi_admin.widgets import displays, filters, inputs
 from starlette.requests import Request
+
 from ballsdex.core.models import (
-    Regime,
-    Economy,
-    Special,
-    BallInstance,
-    User,
     Ball,
-    Player,
-    GuildConfig,
+    BallInstance,
+    BlacklistedGuild,
     BlacklistedID,
+    Economy,
+    GuildConfig,
+    Player,
+    Regime,
+    Special,
+    User,
 )
-from typing import List
 
 
 @app.register
@@ -103,6 +106,7 @@ class SpecialResource(Model):
             input_=inputs.Image(upload=upload, null=True),
         ),
         "emoji",
+        "tradeable",
     ]
 
     async def get_actions(self, request: Request) -> List[Action]:
@@ -244,21 +248,34 @@ class BallInstanceResource(Model):
             placeholder="Search for ball IDs",
         ),
         filters.ForeignKey(model=Ball, name="ball", label="Ball"),
+        filters.ForeignKey(model=Special, name="special", label="Special"),
+        filters.Date(name="catch_date", label="Catch date"),
+        filters.Boolean(name="shiny", label="Shiny"),
+        filters.Boolean(name="favorite", label="Favorite"),
         filters.Search(
             name="player__discord_id",
             label="User ID",
             placeholder="Search for Discord user ID",
         ),
+        filters.Search(
+            name="server_id",
+            label="Server ID",
+            placeholder="Search for Discord server ID",
+        ),
+        filters.Boolean(name="tradeable", label="Tradeable"),
     ]
     fields = [
         "id",
         "ball",
         "player",
         "catch_date",
+        "server_id",
         "shiny",
         "special",
+        "favorite",
         "health_bonus",
         "attack_bonus",
+        "tradeable",
     ]
 
 
@@ -304,7 +321,7 @@ class GuildConfigResource(Model):
 class BlacklistedIDResource(Model):
     label = "Blacklisted user ID"
     model = BlacklistedID
-    icon = "fas fa-lock"
+    icon = "fas fa-user-lock"
     page_title = "Blacklisted user IDs"
     filters = [
         filters.Search(
@@ -312,6 +329,32 @@ class BlacklistedIDResource(Model):
             label="ID",
             search_mode="icontains",
             placeholder="Filter by ID",
+        ),
+        filters.Search(
+            name="reason",
+            label="Reason",
+            search_mode="search",
+            placeholder="Search by reason",
+        ),
+    ]
+    fields = [
+        "discord_id",
+        "reason",
+    ]
+
+
+@app.register
+class BlacklistedGuildIDResource(Model):
+    label = "Blacklisted Guild ID"
+    model = BlacklistedGuild
+    icon = "fas fa-lock"
+    page_title = "Blacklisted Guild IDs"
+    filters = [
+        filters.Search(
+            name="guild_id",
+            label="ID",
+            search_mode="icontains",
+            placeholder="Filter by Guild ID",
         ),
         filters.Search(
             name="reason",
