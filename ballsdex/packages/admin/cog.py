@@ -1,36 +1,61 @@
-import discord
 import logging
 import random
-
-from discord import app_commands
-from discord.ui import Button
-from discord.ext import commands
-from discord.utils import format_dt
-from tortoise.exceptions import IntegrityError, DoesNotExist
+import re
 from collections import defaultdict
+from pathlib import Path
 from typing import TYPE_CHECKING, cast
-from ballsdex.core.utils.buttons import ConfirmChoiceView
 
-from ballsdex.settings import settings
+import discord
+from discord import app_commands
+from discord.ext import commands
+from discord.ui import Button
+from discord.utils import format_dt
+from tortoise.exceptions import BaseORMException, DoesNotExist, IntegrityError
+from tortoise.expressions import Q
+
 from ballsdex.core.models import (
-    GuildConfig,
-    Player,
     Ball,
     BallInstance,
-    BlacklistedID,
     BlacklistedGuild,
+    BlacklistedID,
+    GuildConfig,
+    Player,
+    Trade,
+    TradeObject,
     balls,
 )
-from ballsdex.core.utils.transformers import BallTransform, SpecialTransform
-from ballsdex.core.utils.paginator import FieldPageSource, TextPageSource, Pages
+from ballsdex.core.utils.buttons import ConfirmChoiceView
 from ballsdex.core.utils.logging import log_action
+from ballsdex.core.utils.paginator import FieldPageSource, Pages, TextPageSource
+from ballsdex.core.utils.trades import TradeViewFormat, get_embed
+from ballsdex.core.utils.transformers import (
+    BallTransform,
+    EconomyTransform,
+    RegimeTransform,
+    SpecialTransform,
+)
 from ballsdex.packages.countryballs.countryball import CountryBall
+from ballsdex.settings import settings
 
 if TYPE_CHECKING:
     from ballsdex.core.bot import BallsDexBot
     from ballsdex.packages.countryballs.cog import CountryBallsSpawner
 
 log = logging.getLogger("ballsdex.packages.admin.cog")
+FILENAME_RE = re.compile(r"^(.+)(\.\S+)$")
+
+
+async def save_file(attachment: discord.Attachment) -> Path:
+    path = Path(f"./static/uploads/{attachment.filename}")
+    match = FILENAME_RE.match(attachment.filename)
+    if not match:
+        raise TypeError("The file you uploaded lacks an extension.")
+    i = 1
+    while path.exists():
+        path = Path(f"./static/uploads/{match.group(1)}-{i}{match.group(2)}")
+        i = i + 1
+    await attachment.save(path)
+    return path
 
 
 @app_commands.guilds(*settings.admin_guild_ids)
@@ -53,6 +78,7 @@ class Admin(commands.GroupCog):
         name=settings.players_group_cog_name, description="Balls management"
     )
     logs = app_commands.Group(name="logs", description="Bot logs management")
+    history = app_commands.Group(name="history", description="Trade history management")
 
     @app_commands.command()
     @app_commands.checks.has_any_role(*settings.root_role_ids)
@@ -105,7 +131,7 @@ class Admin(commands.GroupCog):
 
     @app_commands.command()
     @app_commands.checks.has_any_role(*settings.root_role_ids, *settings.admin_role_ids)
-    async def rarity(self, interaction: discord.Interaction, chunked: bool = True):
+    async def rarity(self, interaction: discord.Interaction["BallsDexBot"], chunked: bool = True):
         """
         Generate a list of countryballs ranked by rarity.
 
@@ -175,7 +201,7 @@ class Admin(commands.GroupCog):
             return
 
         embed = discord.Embed()
-        embed.set_author(name=guild.name, icon_url=guild.icon.url)
+        embed.set_author(name=guild.name, icon_url=guild.icon.url if guild.icon else None)
         embed.colour = discord.Colour.orange()
 
         delta = (interaction.created_at - cooldown.time).total_seconds()
@@ -256,13 +282,13 @@ class Admin(commands.GroupCog):
                 value="- " + "\n- ".join(informations),
             )
 
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command()
     @app_commands.checks.has_any_role(*settings.root_role_ids, *settings.admin_role_ids)
     async def guilds(
         self,
-        interaction: discord.Interaction,
+        interaction: discord.Interaction["BallsDexBot"],
         user: discord.User | None = None,
         user_id: str | None = None,
     ):
@@ -425,19 +451,14 @@ class Admin(commands.GroupCog):
         Parameters
         ----------
         ball: Ball
-            The countryball you want to give.
         user: discord.User
-            The user you want to give a countryball to.
         special: Special | None
-            A special background to set.
         shiny: bool
-            Whether the ball will be shiny or not. Omit this to make it random.
+            Omit this to make it random.
         health_bonus: int | None
-            The health bonus in percentage, positive or negative. Omit this to make it random \
-(-20/+20%).
+            Omit this to make it random (-20/+20%).
         attack_bonus: int | None
-            The attack bonus in percentage, positive or negative. Omit this to make it random \
-(-20/+20%).
+            Omit this to make it random (-20/+20%).
         """
         # the transformers triggered a response, meaning user tried an incorrect input
         if interaction.response.is_done():
@@ -449,8 +470,8 @@ class Admin(commands.GroupCog):
             ball=ball,
             player=player,
             shiny=(shiny if shiny is not None else random.randint(1, 2048) == 1),
-            attack_bonus=attack_bonus or random.randint(-20, 20),
-            health_bonus=health_bonus or random.randint(-20, 20),
+            attack_bonus=(attack_bonus if attack_bonus is not None else random.randint(-20, 20)),
+            health_bonus=(health_bonus if health_bonus is not None else random.randint(-20, 20)),
             special=special,
         )
         await interaction.followup.send(
@@ -484,7 +505,6 @@ class Admin(commands.GroupCog):
         user_id: str | None
             The ID of the user you want to blacklist, if it's not in the current server.
         reason: str | None
-            Reason for this blacklist.
         """
         if (user and user_id) or (not user and not user_id):
             await interaction.response.send_message(
@@ -618,7 +638,7 @@ class Admin(commands.GroupCog):
         try:
             blacklisted = await BlacklistedID.get(discord_id=user.id)
         except DoesNotExist:
-            await interaction.response.send_message("That user isn't blacklisted.")
+            await interaction.response.send_message("That user isn't blacklisted.", ephemeral=True)
         else:
             if blacklisted.date:
                 await interaction.response.send_message(
@@ -651,7 +671,6 @@ class Admin(commands.GroupCog):
         guild_id: str
             The ID of the user you want to blacklist, if it's not in the current server.
         reason: str
-            Reason for this blacklist.
         """
 
         try:
@@ -679,7 +698,7 @@ class Admin(commands.GroupCog):
             self.bot.blacklist_guild.add(guild.id)
             await interaction.response.send_message("Guild is now blacklisted.", ephemeral=True)
         await log_action(
-            f"{interaction.user} blacklisted {guild}({guild.id}) "
+            f"{interaction.user} blacklisted the guild {guild}({guild.id}) "
             f"for the following reason: {reason}",
             self.bot,
         )
@@ -789,14 +808,14 @@ class Admin(commands.GroupCog):
             The ID of the ball you want to get information about.
         """
         try:
-            ballIdConverted = int(ball_id, 16)
+            pk = int(ball_id, 16)
         except ValueError:
             await interaction.response.send_message(
                 f"The {settings.collectible_name} ID you gave is not valid.", ephemeral=True
             )
             return
         try:
-            ball = await BallInstance.get(id=ballIdConverted).prefetch_related(
+            ball = await BallInstance.get(id=pk).prefetch_related(
                 "player", "trade_player", "special"
             )
         except DoesNotExist:
@@ -806,7 +825,7 @@ class Admin(commands.GroupCog):
             return
 
         await interaction.response.send_message(
-            f"**{settings.collectible_name.title()} ID:** {ball.id}\n"
+            f"**{settings.collectible_name.title()} ID:** {ball.pk}\n"
             f"**Player:** {ball.player}\n"
             f"**Name:** {ball.countryball}\n"
             f"**Attack bonus:** {ball.attack_bonus}\n"
@@ -814,9 +833,11 @@ class Admin(commands.GroupCog):
             f"**Shiny:** {ball.shiny}\n"
             f"**Special:** {ball.special.name if ball.special else None}\n"
             f"**Caught at:** {format_dt(ball.catch_date, style='R')}\n"
-            f"**Traded:** {ball.trade_player}\n"
+            f"**Caught in:** {ball.server_id if ball.server_id else 'N/A'}\n"
+            f"**Traded:** {ball.trade_player}\n",
+            ephemeral=True,
         )
-        await log_action(f"{interaction.user} got info for {ball} ({ball.id})", self.bot)
+        await log_action(f"{interaction.user} got info for {ball} ({ball.pk})", self.bot)
 
     @balls.command(name="delete")
     @app_commands.checks.has_any_role(*settings.root_role_ids)
@@ -847,7 +868,7 @@ class Admin(commands.GroupCog):
         await interaction.response.send_message(
             f"{settings.collectible_name.title()} {ball_id} deleted.", ephemeral=True
         )
-        await log_action(f"{interaction.user} deleted {ball} ({ball.id})", self.bot)
+        await log_action(f"{interaction.user} deleted {ball} ({ball.pk})", self.bot)
 
     @balls.command(name="transfer")
     @app_commands.checks.has_any_role(*settings.root_role_ids)
@@ -872,7 +893,7 @@ class Admin(commands.GroupCog):
             )
             return
         try:
-            ball = await BallInstance.get(id=ballIdConverted)
+            ball = await BallInstance.get(id=ballIdConverted).prefetch_related("player")
             original_player = ball.player
         except DoesNotExist:
             await interaction.response.send_message(
@@ -882,12 +903,15 @@ class Admin(commands.GroupCog):
         player, _ = await Player.get_or_create(discord_id=user.id)
         ball.player = player
         await ball.save()
+
+        trade = await Trade.create(player1=original_player, player2=player)
+        await TradeObject.create(trade=trade, ballinstance=ball, player=original_player)
         await interaction.response.send_message(
-            f"{settings.collectible_name.title()} {ball.countryball} transferred to {user}.",
+            f"Transfered {ball} ({ball.pk}) from {original_player} to {user}.",
             ephemeral=True,
         )
         await log_action(
-            f"{interaction.user} transferred {ball} ({ball.id}) from {original_player} to {user}",
+            f"{interaction.user} transferred {ball} ({ball.pk}) from {original_player} to {user}",
             self.bot,
         )
 
@@ -955,10 +979,10 @@ class Admin(commands.GroupCog):
     async def balls_count(
         self,
         interaction: discord.Interaction,
-        user: discord.User = None,
-        ball: BallTransform = None,
-        shiny: bool = None,
-        special: SpecialTransform = None,
+        user: discord.User | None = None,
+        ball: BallTransform | None = None,
+        shiny: bool | None = None,
+        special: SpecialTransform | None = None,
     ):
         """
         Count the number of balls that a player has or how many exist in total.
@@ -968,12 +992,11 @@ class Admin(commands.GroupCog):
         user: discord.User
             The user you want to count the balls of.
         ball: Ball
-            The ball you want to count.
         shiny: bool
-            Whether the ball is shiny or not.
         special: Special
-            The special background of the ball.
         """
+        if interaction.response.is_done():
+            return
         filters = {}
         if ball:
             filters["ball"] = ball
@@ -984,17 +1007,150 @@ class Admin(commands.GroupCog):
         if user:
             filters["player__discord_id"] = user.id
         await interaction.response.defer(ephemeral=True, thinking=True)
-        balls = await BallInstance.filter(**filters)
+        balls = await BallInstance.filter(**filters).count()
         country = f"{ball.country} " if ball else ""
-        plural = "s" if len(balls) > 1 else ""
-        special = f"{special.name} " if special else ""
+        plural = "s" if balls > 1 or balls == 0 else ""
+        special_str = f"{special.name} " if special else ""
+        shiny_str = "shiny" if shiny else ""
         if user:
             await interaction.followup.send(
-                f"{user} has {len(balls)} {special}{country}{settings.collectible_name}{plural}."
+                f"{user} has {balls} {special_str}{shiny_str}"
+                f"{country}{settings.collectible_name}{plural}."
             )
         else:
             await interaction.followup.send(
-                f"There are {len(balls)} {special}{country}{settings.collectible_name}{plural}."
+                f"There are {balls} {special_str}{shiny_str}"
+                f"{country}{settings.collectible_name}{plural}."
+            )
+
+    @balls.command(name="create")
+    @app_commands.checks.has_any_role(*settings.root_role_ids)
+    async def balls_create(
+        self,
+        interaction: discord.Interaction,
+        *,
+        name: app_commands.Range[str, None, 48],
+        regime: RegimeTransform,
+        health: int,
+        attack: int,
+        emoji_id: app_commands.Range[str, 17, 21],
+        capacity_name: app_commands.Range[str, None, 64],
+        capacity_description: app_commands.Range[str, None, 256],
+        collection_card: discord.Attachment,
+        image_credits: str,
+        economy: EconomyTransform | None = None,
+        rarity: float = 0.0,
+        enabled: bool = False,
+        tradeable: bool = False,
+        wild_card: discord.Attachment | None = None,
+    ):
+        """
+        Shortcut command for creating countryballs. They are disabled by default.
+
+        Parameters
+        ----------
+        name: str
+        regime: Regime
+        economy: Economy | None
+        health: int
+        attack: int
+        emoji_id: str
+            An emoji ID, the bot will check if it can access the custom emote
+        capacity_name: str
+        capacity_description: str
+        collection_card: discord.Attachment
+        image_credits: str
+        rarity: float
+            Value defining the rarity of this countryball, if enabled
+        enabled: bool
+            If true, the countryball can spawn and will show up in global completion
+        tradeable: bool
+            If false, all instances are untradeable
+        wild_card: discord.Attachment
+            Artwork used to spawn the countryball, with a default
+        """
+        if regime is None or interaction.response.is_done():  # economy autocomplete failed
+            return
+
+        if not emoji_id.isnumeric():
+            await interaction.response.send_message(
+                "`emoji_id` is not a valid number.", ephemeral=True
+            )
+            return
+        emoji = self.bot.get_emoji(int(emoji_id))
+        if not emoji:
+            await interaction.response.send_message(
+                "The bot does not have access to the given emoji.", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        default_path = Path("./ballsdex/core/image_generator/src/default.png")
+        missing_default = ""
+        if not wild_card and not default_path.exists():
+            missing_default = (
+                "**Warning:** The default spawn image is not set. This will result in errors when "
+                f"attempting to spawn this {settings.collectible_name}. You can edit this on the "
+                "web panel or add an image at `./ballsdex/core/image_generator/src/default.png`.\n"
+            )
+
+        try:
+            collection_card_path = await save_file(collection_card)
+        except Exception as e:
+            log.exception("Failed saving file when creating countryball", exc_info=True)
+            await interaction.followup.send(
+                f"Failed saving the attached file: {collection_card.url}.\n"
+                f"Partial error: {', '.join(str(x) for x in e.args)}\n"
+                "The full error is in the bot logs."
+            )
+            return
+        try:
+            wild_card_path = await save_file(wild_card) if wild_card else default_path
+        except Exception as e:
+            log.exception("Failed saving file when creating countryball", exc_info=True)
+            await interaction.followup.send(
+                f"Failed saving the attached file: {collection_card.url}.\n"
+                f"Partial error: {', '.join(str(x) for x in e.args)}\n"
+                "The full error is in the bot logs."
+            )
+            return
+
+        try:
+            ball = await Ball.create(
+                country=name,
+                regime=regime,
+                economy=economy,
+                health=health,
+                attack=attack,
+                rarity=rarity,
+                enabled=enabled,
+                tradeable=tradeable,
+                emoji_id=emoji_id,
+                wild_card="/" + str(wild_card_path),
+                collection_card="/" + str(collection_card_path),
+                credits=image_credits,
+                capacity_name=capacity_name,
+                capacity_description=capacity_description,
+            )
+        except BaseORMException as e:
+            log.exception("Failed creating countryball with admin command", exc_info=True)
+            await interaction.followup.send(
+                f"Failed creating the {settings.collectible_name}.\n"
+                f"Partial error: {', '.join(str(x) for x in e.args)}\n"
+                "The full error is in the bot logs."
+            )
+        else:
+            files = [await collection_card.to_file()]
+            if wild_card:
+                files.append(await wild_card.to_file())
+            await self.bot.load_cache()
+            await interaction.followup.send(
+                f"Successfully created a {settings.collectible_name} with ID {ball.pk}! "
+                "The internal cache was reloaded.\n"
+                f"{missing_default}\n"
+                f"{name=} regime={regime.name} economy={economy.name if economy else None} "
+                f"{health=} {attack=} {rarity=} {enabled=} {tradeable=} emoji={emoji}",
+                files=files,
             )
 
     @logs.command(name="catchlogs")
@@ -1046,3 +1202,120 @@ class Admin(commands.GroupCog):
             await interaction.response.send_message(
                 f"{user} added to command logs.", ephemeral=True
             )
+
+    @history.command(name="user")
+    @app_commands.checks.has_any_role(*settings.root_role_ids, *settings.admin_role_ids)
+    @app_commands.choices(
+        sorting=[
+            app_commands.Choice(name="Most Recent", value="-date"),
+            app_commands.Choice(name="Oldest", value="date"),
+        ]
+    )
+    async def history_user(
+        self,
+        interaction: discord.Interaction["BallsDexBot"],
+        user: discord.User,
+        sorting: app_commands.Choice[str],
+    ):
+        """
+        Show the history of a user.
+        """
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        history = (
+            await Trade.filter(Q(player1__discord_id=user.id) | Q(player2__discord_id=user.id))
+            .order_by(sorting.value)
+            .prefetch_related("player1", "player2")
+        )
+        if not history:
+            await interaction.followup.send("No history found.", ephemeral=True)
+            return
+        source = TradeViewFormat(history, user.display_name, self.bot)
+        pages = Pages(source=source, interaction=interaction)
+        await pages.start(ephemeral=True)
+
+    @history.command(name="ball")
+    @app_commands.checks.has_any_role(*settings.root_role_ids)
+    @app_commands.choices(
+        sorting=[
+            app_commands.Choice(name="Most Recent", value="-date"),
+            app_commands.Choice(name="Oldest", value="date"),
+        ]
+    )
+    async def history_ball(
+        self,
+        interaction: discord.Interaction["BallsDexBot"],
+        ballid: str,
+        sorting: app_commands.Choice[str],
+    ):
+        """
+        Show the history of a ball.
+        """
+
+        try:
+            pk = int(ballid, 16)
+        except ValueError:
+            await interaction.response.send_message(
+                f"The {settings.collectible_name} ID you gave is not valid.", ephemeral=True
+            )
+            return
+
+        ball = await BallInstance.get(id=pk)
+        if not ball:
+            await interaction.response.send_message(
+                f"The {settings.collectible_name} ID you gave does not exist.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        history = await TradeObject.filter(ballinstance__id=pk).prefetch_related(
+            "trade", "ballinstance__player"
+        )
+        if not history:
+            await interaction.followup.send("No history found.", ephemeral=True)
+            return
+        trades = (
+            await Trade.filter(id__in=[x.trade_id for x in history])
+            .order_by(sorting.value)
+            .prefetch_related("player1", "player2")
+        )
+        source = TradeViewFormat(trades, f"{settings.collectible_name} {ball}", self.bot)
+        pages = Pages(source=source, interaction=interaction)
+        await pages.start(ephemeral=True)
+
+    @history.command(name="trade")
+    @app_commands.checks.has_any_role(*settings.root_role_ids)
+    async def trade_info(
+        self,
+        interaction: discord.Interaction["BallsDexBot"],
+        tradeid: str,
+    ):
+        """
+        Show the contents of a certain trade.
+        """
+        try:
+            pk = int(tradeid, 16)
+        except ValueError:
+            await interaction.response.send_message(
+                "The trade ID you gave is not valid.", ephemeral=True
+            )
+            return
+        trade = await Trade.get(id=pk).prefetch_related("player1", "player2")
+        if not trade:
+            await interaction.response.send_message(
+                "The trade ID you gave does not exist.", ephemeral=True
+            )
+            return
+        embed = discord.Embed(
+            title=f"Trade {trade.pk:0X}",
+            description=f"Trade ID: {trade.pk:0X}",
+            timestamp=trade.date,
+        )
+        player1balls = await trade.tradeobjects.filter(player=trade.player2).prefetch_related(
+            "ballinstance"
+        )
+        player2balls = await trade.tradeobjects.filter(player=trade.player1).prefetch_related(
+            "ballinstance"
+        )
+        embed.set_footer(text="Trade date: ")
+        embed = await get_embed(embed, trade, player1balls, player2balls, self.bot)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
