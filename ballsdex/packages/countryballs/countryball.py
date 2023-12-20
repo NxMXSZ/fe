@@ -1,11 +1,12 @@
-import discord
 import logging
 import random
 import string
 
-from ballsdex.settings import settings
+import discord
+
 from ballsdex.core.models import Ball, balls
 from ballsdex.packages.countryballs.components import CatchView
+from ballsdex.settings import settings
 
 log = logging.getLogger("ballsdex.packages.countryballs")
 
@@ -26,7 +27,7 @@ class CountryBall:
         cb = random.choices(population=countryballs, weights=rarities, k=1)[0]
         return cls(cb)
 
-    async def spawn(self, channel: discord.abc.Messageable):
+    async def spawn(self, channel: discord.TextChannel):
         def generate_random_name():
             source = string.ascii_uppercase + string.ascii_lowercase + string.ascii_letters
             return "".join(random.choices(source, k=15))
@@ -35,11 +36,15 @@ class CountryBall:
         file_location = "." + self.model.wild_card
         file_name = f"nt_{generate_random_name()}.{extension}"
         try:
-            self.message = await channel.send(
-                f"Look! Its a {settings.collectible_name} !! Catch it!",
-                view=CatchView(self),
-                file=discord.File(file_location, filename=file_name),
-            )
+            permissions = channel.permissions_for(channel.guild.me)
+            if permissions.attach_files and permissions.send_messages:
+                self.message = await channel.send(
+                    f"A wild {settings.collectible_name} appeared!",
+                    view=CatchView(self),
+                    file=discord.File(file_location, filename=file_name),
+                )
+            else:
+                log.error("Missing permission to spawn ball in channel %s.", channel)
         except discord.Forbidden:
             log.error(f"Missing permission to spawn ball in channel {channel}.")
         except discord.HTTPException:
